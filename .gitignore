@@ -6,3 +6,8 @@ build/
 dist/
 *.spec
 .env
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
