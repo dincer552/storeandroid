@@ -51,7 +51,7 @@ class ScannerTests(unittest.TestCase):
     @patch("mac_finder.network.scanner.get_active_adapters")
     def test_full_scan_refreshes_arp_after_ping(self, adapters, arp, hostname):
         adapters.return_value = self.adapter
-        arp.return_value = [
+        arp.side_effect = [
             [],
             [{"ip": "192.168.7.2", "mac": "00-11-22-33-44-55",
               "type": "dynamic", "interface": "192.168.7.10"}]
