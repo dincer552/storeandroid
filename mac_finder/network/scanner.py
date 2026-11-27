@@ -31,6 +31,8 @@ class ARPScanner:
     def _safe_entries(entries, network):
         result = {}
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             try:
                 address = ipaddress.ip_address(entry.get("ip", ""))
                 if address in network and normalize_mac(entry.get("mac")):
