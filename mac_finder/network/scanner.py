@@ -1,4 +1,4 @@
-"""Safe, bounded local subnet and target-MAC discovery."""
+"""Bounded local IPv4 discovery using ARP cache, optional Scapy, then ping + ARP."""
 import ipaddress
 import platform
 import socket
@@ -7,121 +7,228 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from ..network.adapter import get_active_adapters
-from ..network.arp import get_arp_table, get_gateway_from_arp
+from ..network.arp import get_arp_table
 from ..network.mac import normalize_mac, macs_match
 from ..network.vendor import lookup_vendor
+from .hostname import resolve_hostname
 
 
 class ARPScanner:
     def __init__(self, target_mac=None, workers=48, timeout_ms=650, max_hosts=4096):
         self.target_mac = normalize_mac(target_mac) if target_mac else None
-        self.workers = max(4, min(int(workers), 128))
-        self.timeout_ms = max(200, min(int(timeout_ms), 5000))
-        self.max_hosts = max(16, min(int(max_hosts), 65536))
-        self.found_device = None
+        self.workers = max(4, min(int(workers), 96))
+        self.timeout_ms = max(250, min(int(timeout_ms), 3000))
+        self.max_hosts = max(16, min(int(max_hosts), 4096))
+        self.cancelled = False
         self.scan_progress = 0
         self.total_devices = 0
-        self.cancelled = False
+        self.found_device = None
 
     def cancel(self):
         self.cancelled = True
 
-    def _ping(self, ip):
+    @staticmethod
+    def _safe_entries(entries, network):
+        result = {}
+        for entry in entries:
+            try:
+                address = ipaddress.ip_address(entry.get("ip", ""))
+                if address in network and normalize_mac(entry.get("mac")):
+                    item = dict(entry)
+                    item["mac"] = normalize_mac(item["mac"])
+                    item["ip"] = str(address)
+                    result[item["ip"]] = item
+            except ValueError:
+                continue
+        return result
+
+    @staticmethod
+    def _online(entry):
+        state = (entry.get("type") or "").lower()
+        return state in {"dynamic", "reachable", "delay", "probe", "stale", "permanent", "noarp"}
+
+    def _adapter_for(self, network, selected_adapter_ip=None):
+        adapters = get_active_adapters()
+        if selected_adapter_ip:
+            selected = next((item for item in adapters if item["ip"] == selected_adapter_ip), None)
+            if selected:
+                return selected
+        for adapter in adapters:
+            try:
+                if ipaddress.ip_address(adapter["ip"]) in network:
+                    return adapter
+            except ValueError:
+                continue
+        return adapters[0] if adapters else {
+            "name": "Bilinmiyor", "gateway": "Bilinmiyor", "ip": "",
+        }
+
+    @staticmethod
+    def _interface_name(entry, adapter):
+        interface = entry.get("interface") or ""
+        if interface == adapter.get("ip"):
+            return adapter.get("name", interface)
+        if interface:
+            return interface
+        return adapter.get("name", "Bilinmiyor")
+
+    def _device(self, entry, adapter, method):
+        return {
+            "mac": normalize_mac(entry["mac"]),
+            "ip": entry["ip"],
+            "hostname": resolve_hostname(entry["ip"]),
+            "vendor": lookup_vendor(entry["mac"]),
+            "gateway": adapter.get("gateway", "Bilinmiyor"),
+            "interface": self._interface_name(entry, adapter),
+            "method": method,
+            "online": self._online(entry),
+            "first_seen": None,
+            "last_seen": time.time(),
+        }
+
+    @staticmethod
+    def _ping(ip, timeout_ms):
         system = platform.system().lower()
-        command = (["ping", "-n", "1", "-w", str(self.timeout_ms), ip] if system == "windows"
-                   else ["ping", "-c", "1", "-W", str(max(1, self.timeout_ms // 1000)), ip])
+        if system == "windows":
+            command = ["ping", "-n", "1", "-w", str(timeout_ms), ip]
+        else:
+            command = ["ping", "-c", "1", "-W", str(max(1, timeout_ms // 1000)), ip]
         try:
-            result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=max(2, self.timeout_ms / 1000 + 1),
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if system == "windows" else 0)
+            result = subprocess.run(
+                command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=(timeout_ms / 1000) + 2,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if system == "windows" else 0,
+            )
             return result.returncode == 0
         except (OSError, subprocess.SubprocessError):
             return False
 
-    @staticmethod
-    def _hostname(ip):
+    def _scapy_sweep(self, network):
+        """Optional Layer-2 ARP discovery. Requires Scapy and a suitable capture driver."""
         try:
-            return socket.gethostbyaddr(ip)[0]
-        except (OSError, socket.herror):
-            return "Bilinmiyor"
+            from scapy.all import ARP, Ether, srp
+            answered, _ = srp(
+                Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(network)),
+                timeout=1.5, retry=1, verbose=0
+            )
+            return [
+                {"ip": received.psrc, "mac": received.hwsrc,
+                 "type": "reachable", "interface": "Scapy"}
+                for _, received in answered
+            ]
+        except Exception:
+            # Missing Scapy, Npcap, permissions, or unsupported capture driver is a normal fallback.
+            return []
 
-    def _make_device(self, entry, adapter, method):
-        state = entry.get("type", "").lower()
-        return {
-            "ip": entry["ip"], "mac": entry["mac"], "hostname": self._hostname(entry["ip"]),
-            "vendor": lookup_vendor(entry["mac"]),
-            "interface": entry.get("interface") or adapter.get("name", "Bilinmiyor"),
-            "gateway": adapter.get("gateway", "Bilinmiyor"),
-            "online": state not in ("incomplete", "failed", "static"),
-            "method": method, "timestamp": time.time()
-        }
-
-    def scan_network(self, cidr, progress_callback=None):
-        """Discover devices in a supplied IPv4 CIDR; only scan bounded local ranges."""
+    def _validate_network(self, cidr):
         try:
             network = ipaddress.ip_network(cidr, strict=False)
         except ValueError as exc:
-            raise ValueError("Geçersiz IP/CIDR: " + str(exc))
+            raise ValueError(f"Invalid IPv4 subnet: {exc}")
         if not isinstance(network, ipaddress.IPv4Network):
-            raise ValueError("Şu anda yalnızca IPv4 subnet taraması destekleniyor.")
-        if network.num_addresses - 2 > self.max_hosts:
-            raise ValueError(f"Ağ çok büyük ({network.num_addresses} adres). Tarama sınırı: {self.max_hosts} adres.")
-        adapters = get_active_adapters()
-        adapter = next((item for item in adapters if ipaddress.ip_address(item["ip"]) in network),
-                       adapters[0] if adapters else {"name":"Bilinmiyor", "gateway":"Bilinmiyor"})
-        entries = {entry["ip"]: entry for entry in get_arp_table() if entry.get("ip") and entry.get("mac")}
-        self.total_devices = max(0, network.num_addresses - 2)
+            raise ValueError("Only IPv4 subnet scans are supported.")
+        host_count = max(0, network.num_addresses - 2)
+        if host_count > self.max_hosts:
+            raise ValueError(
+                f"Subnet has {host_count} host addresses; maximum is {self.max_hosts}."
+            )
+        return network
+
+    def scan_network(self, cidr, selected_adapter_ip=None, progress_callback=None):
+        """Discover all responsive/cached devices on one bounded local IPv4 subnet."""
+        network = self._validate_network(cidr)
+        adapter = self._adapter_for(network, selected_adapter_ip)
+        self.cancelled = False
         self.scan_progress = 0
-        results = []
-        known = {ip: entry for ip, entry in entries.items()
-                 if ipaddress.ip_address(ip) in network and entry.get("type") not in ("incomplete", "failed")}
-        for entry in known.values():
-            results.append(self._make_device(entry, adapter, "ARP önbelleği"))
-        targets = [str(ip) for ip in network.hosts() if str(ip) not in known and not self.cancelled]
-        with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            futures = {pool.submit(self._ping, ip): ip for ip in targets}
-            for future in as_completed(futures):
-                if self.cancelled:
-                    for pending in futures:
-                        pending.cancel()
-                    break
-                future.result()
-                self.scan_progress += 1
-                if progress_callback:
-                    progress_callback(self.scan_progress, self.total_devices)
-        # Re-read ARP after ping. A cache snapshot from before probing misses newly learned MACs.
-        for entry in get_arp_table():
-            if entry.get("ip") and entry.get("mac") and ipaddress.ip_address(entry["ip"]) in network:
-                entries[entry["ip"]] = entry
-        seen = {device["ip"] for device in results}
-        for ip, entry in entries.items():
-            if ip not in seen and ipaddress.ip_address(ip) in network:
-                results.append(self._make_device(entry, adapter, "Ping + ARP"))
-        return sorted(results, key=lambda item: ipaddress.ip_address(item["ip"]))
+        self.total_devices = max(0, network.num_addresses - 2)
 
-    def scan_subnet(self, ip, netmask, progress_callback=None):
-        # ip_network accepts dotted netmasks; never cast 255.255.255.0 to int.
-        return self.scan_network(f"{ip}/{netmask}", progress_callback)
+        # Step 1: current OS neighbour cache.
+        entries = self._safe_entries(get_arp_table(), network)
+        methods = {ip: "arp_table" for ip in entries}
 
-    def find_mac(self, mac, cidr, progress_callback=None):
+        # Step 2: optional raw ARP discovery; gracefully fall back when unavailable.
+        for ip, entry in self._safe_entries(self._scapy_sweep(network), network).items():
+            entries[ip] = entry
+            methods[ip] = "scapy"
+
+        # Step 3: bounded ping sweep. Refresh ARP after each small batch.
+        hosts = [str(host) for host in network.hosts()]
+        batch_size = max(8, self.workers)
+        for offset in range(0, len(hosts), batch_size):
+            if self.cancelled:
+                break
+            batch = hosts[offset:offset + batch_size]
+            with ThreadPoolExecutor(max_workers=min(self.workers, len(batch) or 1)) as pool:
+                futures = {pool.submit(self._ping, host, self.timeout_ms): host for host in batch}
+                for future in as_completed(futures):
+                    if self.cancelled:
+                        break
+                    future.result()
+                    self.scan_progress += 1
+                    if progress_callback:
+                        progress_callback(self.scan_progress, self.total_devices)
+            refreshed = self._safe_entries(get_arp_table(), network)
+            for ip, entry in refreshed.items():
+                if ip not in entries:
+                    methods[ip] = "ping+arp"
+                entries[ip] = entry
+
+        devices = []
+        for ip in sorted(entries, key=ipaddress.ip_address):
+            entry = entries[ip]
+            method = methods.get(ip, "arp_table")
+            devices.append(self._device(entry, adapter, method))
+        return devices
+
+    def find_mac(self, mac, cidr, selected_adapter_ip=None, progress_callback=None):
+        """Find one MAC; stop after an ARP/Scapy/ping batch reveals the target."""
         target = normalize_mac(mac)
         if not target:
-            raise ValueError("Geçersiz MAC adresi")
-        self.target_mac = target
-        try:
-            requested_network = ipaddress.ip_network(cidr, strict=False)
-        except ValueError as exc:
-            raise ValueError("Geçersiz IP/CIDR: " + str(exc))
-        match = next((entry for entry in get_arp_table()
-                      if entry.get("ip") and ipaddress.ip_address(entry["ip"]) in requested_network
-                      and macs_match(entry.get("mac"), target)), None)
-        adapters = get_active_adapters()
-        adapter = next((item for item in adapters if match and item["ip"] == match.get("interface")),
-                       adapters[0] if adapters else {
-                           "name":"Bilinmiyor", "gateway":get_gateway_from_arp() or "Bilinmiyor"})
-        if match:
-            self.found_device = self._make_device(match, adapter, "ARP önbelleği")
-            return self.found_device
-        devices = self.scan_network(cidr, progress_callback)
-        self.found_device = next((device for device in devices if macs_match(device.get("mac"), target)), None)
-        return self.found_device
+            raise ValueError("Invalid MAC address.")
+        network = self._validate_network(cidr)
+        adapter = self._adapter_for(network, selected_adapter_ip)
+        self.cancelled = False
+        self.total_devices = max(0, network.num_addresses - 2)
+        self.scan_progress = 0
+
+        entries = self._safe_entries(get_arp_table(), network)
+        for ip, entry in entries.items():
+            if macs_match(entry.get("mac"), target):
+                self.found_device = self._device(entry, adapter, "arp_table")
+                return self.found_device
+
+        for ip, entry in self._safe_entries(self._scapy_sweep(network), network).items():
+            if macs_match(entry.get("mac"), target):
+                self.found_device = self._device(entry, adapter, "scapy")
+                return self.found_device
+            entries[ip] = entry
+
+        hosts = [str(host) for host in network.hosts()]
+        batch_size = max(8, self.workers)
+        for offset in range(0, len(hosts), batch_size):
+            if self.cancelled:
+                break
+            batch = hosts[offset:offset + batch_size]
+            with ThreadPoolExecutor(max_workers=min(self.workers, len(batch) or 1)) as pool:
+                futures = {pool.submit(self._ping, host, self.timeout_ms): host for host in batch}
+                for future in as_completed(futures):
+                    if self.cancelled:
+                        break
+                    future.result()
+                    self.scan_progress += 1
+                    if progress_callback:
+                        progress_callback(self.scan_progress, self.total_devices)
+            refreshed = self._safe_entries(get_arp_table(), network)
+            for ip, entry in refreshed.items():
+                entries[ip] = entry
+                if macs_match(entry.get("mac"), target):
+                    self.found_device = self._device(entry, adapter, "ping+arp")
+                    return self.found_device
+        self.found_device = None
+        return None
+
+    def scan_subnet(self, ip, netmask, selected_adapter_ip=None, progress_callback=None):
+        return self.scan_network(
+            f"{ip}/{netmask}", selected_adapter_ip=selected_adapter_ip,
+            progress_callback=progress_callback
+        )
