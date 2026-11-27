@@ -30,6 +30,8 @@ jobs:
         run: python -m compileall -q main.py mac_finder tests
       - name: Run offline unit tests
         run: python -m unittest discover -s tests -v
+      - name: Smoke-test application imports
+        run: python -c "from mac_finder.gui.main_window import MACFinderApp; from mac_finder.inventory import InventoryStore; print('GUI and inventory imports OK')"
       - name: Build executable
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MACFinder --collect-all psutil main.py
       - name: Verify executable
