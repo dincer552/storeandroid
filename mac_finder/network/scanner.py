@@ -45,23 +45,28 @@ class ARPScanner:
     @staticmethod
     def _online(entry):
         state = (entry.get("type") or "").lower()
-        return state in {"dynamic", "reachable", "delay", "probe", "stale", "permanent", "noarp"}
+        return state in {"dynamic", "reachable", "delay", "probe", "permanent", "noarp"}
 
     def _adapter_for(self, network, selected_adapter_ip=None):
         adapters = get_active_adapters()
+        candidates = []
         if selected_adapter_ip:
             selected = next((item for item in adapters if item["ip"] == selected_adapter_ip), None)
-            if selected:
-                return selected
-        for adapter in adapters:
+            if not selected:
+                raise ValueError("Selected network adapter is no longer active.")
+            candidates = [selected]
+        else:
+            candidates = adapters
+        for adapter in candidates:
             try:
-                if ipaddress.ip_address(adapter["ip"]) in network:
+                local_network = ipaddress.ip_network(adapter["network"], strict=False)
+                if network.subnet_of(local_network):
                     return adapter
-            except ValueError:
+            except (KeyError, ValueError):
                 continue
-        return adapters[0] if adapters else {
-            "name": "Bilinmiyor", "gateway": "Bilinmiyor", "ip": "",
-        }
+        raise ValueError(
+            "For safety, scans are restricted to a subnet inside the selected active adapter's local network."
+        )
 
     @staticmethod
     def _interface_name(entry, adapter):
