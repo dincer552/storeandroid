@@ -27,13 +27,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
       - name: Compile Python modules
-        run: python -m compileall -q main.py mac_finder
+        run: python -m compileall -q main.py mac_finder tests
+      - name: Run offline unit tests
+        run: python -m unittest discover -s tests -v
       - name: Build executable
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MACFinder --collect-all psutil main.py
       - name: Verify executable
         shell: pwsh
         run: |
           if (!(Test-Path "dist/MACFinder.exe")) { throw "MACFinder.exe was not created" }
+          $file = Get-Item "dist/MACFinder.exe"
+          if ($file.Length -lt 1000000) { throw "MACFinder.exe is unexpectedly small" }
+          Write-Host "Built $($file.FullName) ($($file.Length) bytes)"
       - uses: actions/upload-artifact@v4
         with:
           name: MACFinder-Windows
@@ -47,4 +52,4 @@ jobs:
           files: dist/MACFinder.exe
           generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: \${{ secrets.GITHUB_TOKEN }}
