@@ -296,7 +296,7 @@ class MACFinderApp:
         right.pack_propagate(False)
         self._section(left, "Son görülen cihazlar", "Envanterden alınan gerçek kayıtlar")
         panel = self._panel(left)
-        self._create_table(panel, compact=True)
+        self.device_tree = self._create_table(panel, compact=True)
         self._populate_table(records[:12])
         self._section(right, "Hızlı işlemler", "Yerel ağ keşif araçları")
         actions = self._panel(right)
@@ -408,6 +408,7 @@ class MACFinderApp:
         self._button(toolbar, "CSV", lambda: self._export_inventory("csv"), secondary=True).pack(side="right", padx=(6, 0))
         self._button(toolbar, "JSON", lambda: self._export_inventory("json"), secondary=True).pack(side="right")
         self.search_widget = search
+        search.bind("<KeyRelease>", lambda _event: self._refresh_inventory())
         self.device_tree = self._create_table(self.content)
         self.device_tree.bind("<<TreeviewSelect>>", self._selection_changed)
         bottom = tk.Frame(self.content, bg=self.C["bg"])
@@ -637,10 +638,12 @@ class MACFinderApp:
         scanner = self.active_scanner
         def task():
             devices = scanner.scan_network(cidr, selected_ip, self._progress_callback)
+            completed = not scanner.cancelled
             new_count = self.store.save_scan_results(
-                devices, cidr=cidr, scan_type="full_scan", target=cidr
+                devices, cidr=cidr if completed else None,
+                scan_type="full_scan" if completed else "partial_scan", target=cidr
             )
-            return {"devices": devices, "new_count": new_count, "cidr": cidr}
+            return {"devices": devices, "new_count": new_count, "cidr": cidr, "cancelled": not completed}
         self._start_worker("Tüm ağ taraması", task)
 
     def _cancel_scan(self):
@@ -877,18 +880,20 @@ class MACFinderApp:
                             self.progress_var.set(100)
                             self.progress_text.config(text="MAC arama tamamlandı")
                     elif task == "Tüm ağ taraması":
-                        self.scan_summary.config(
-                            text=(f"Tamamlandı · {len(result['devices'])} cihaz · "
-                                  f"{result['new_count']} yeni kayıt · {result['cidr']}"),
-                            fg=self.C["green"])
+                        if self.current_page == "Tüm Ağı Tara" and self.scan_summary.winfo_exists():
+                            summary = "Durduruldu" if result.get("cancelled") else "Tamamlandı"
+                            self.scan_summary.config(
+                                text=(f"{summary} · {len(result['devices'])} cihaz · "
+                                      f"{result['new_count']} yeni kayıt · {result['cidr']}"),
+                                fg=self.C["amber"] if result.get("cancelled") else self.C["green"])
                         if result["new_count"] and self.notify_var.get():
                             self.root.bell()
-                        if hasattr(self, "progress_var"):
+                        if self.current_page == "Tüm Ağı Tara" and hasattr(self, "progress_text") and self.progress_text.winfo_exists():
                             self.progress_var.set(100)
-                            self.progress_text.config(text="Tamamlandı")
+                            self.progress_text.config(text="Tamamlandı" if not result.get("cancelled") else "Tarama durduruldu")
                         self.status_var.set(
                             f"Ağ taraması tamamlandı · {len(result['devices'])} cihaz bulundu")
-                    elif task == "Meraki port arama":
+                    elif task == "Meraki port arama" and self.current_page == "Meraki API":
                         self._show_meraki_result(result)
                     self._refresh_visible_data()
         except queue.Empty:
