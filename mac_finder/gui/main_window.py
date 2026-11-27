@@ -330,6 +330,7 @@ class MACFinderApp:
             columns, headings = self.COLUMNS, self.HEADINGS
             widths = (135, 110, 130, 145, 125, 110, 125, 90, 135, 135, 80)
         tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+        tree._macfinder_compact = compact
         for column, heading, width in zip(columns, headings, widths):
             tree.heading(column, text=heading)
             tree.column(column, width=width, minwidth=70, anchor="w", stretch=False)
@@ -360,7 +361,7 @@ class MACFinderApp:
         for iid in tree.get_children():
             tree.delete(iid)
         self.visible_rows = {}
-        compact = len(tree["columns"]) == 5
+        compact = getattr(tree, "_macfinder_compact", False)
         for row in records:
             online = bool(row.get("online"))
             if compact:
