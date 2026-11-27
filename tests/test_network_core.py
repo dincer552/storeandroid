@@ -54,7 +54,7 @@ class ScannerTests(unittest.TestCase):
         arp.side_effect = [
             [],
             [{"ip": "192.168.7.2", "mac": "00-11-22-33-44-55",
-              "type": "dynamic", "interface": "192.168.7.10"}]
+              "type": "static", "interface": "192.168.7.10"}]
         ]
         scanner = ARPScanner(workers=4)
         scanner._scapy_sweep = lambda network: []
