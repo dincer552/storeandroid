@@ -14,14 +14,14 @@ Windows masaüstü uygulaması: yerel IPv4 keşfi, MAC-IP bulma, sınırlı TCP 
 - CSV dışa aktarma ve oturumluk tarama geçmişi
 
 ## Kurulum
-\`\`\`powershell
+```powershell
 python -m pip install -r requirements.txt
 python main.py
-\`\`\`
+```
 
 ## Windows EXE
-\`build.bat\` çalıştırın. Çıktı: \`dist\\MACFinder.exe\`.
-GitHub Actions, Python modüllerini derler, aynı adlı EXE'yi oluşturur ve artifact olarak yükler. \`v*\` etiketi push edilirse ayrıca GitHub Release yayımlar.
+`build.bat` çalıştırın. Çıktı: `dist\MACFinder.exe`.
+GitHub Actions, Python modüllerini derler, aynı adlı EXE'yi oluşturur ve artifact olarak yükler. `v*` etiketi push edilirse ayrıca GitHub Release yayımlar.
 
 ## Sınırlamalar
 - ARP yalnızca yerel L2/VLAN segmentinde MAC-IP eşleşmesini görebilir. Farklı VLAN'lar için router/switch/controller verisi gerekir.
@@ -34,4 +34,4 @@ GitHub Actions, Python modüllerini derler, aynı adlı EXE'yi oluşturur ve art
 - Gerçek Windows ağ davranışı Windows makinede ve hedef ağa erişimle doğrulanmalıdır.
 
 ## Test MAC
-\`B8:AB:61:AB:DA:6E\` (etiketteki örnek Meraki MS120-24P MAC adresi).
+`B8:AB:61:AB:DA:6E` (etiketteki örnek Meraki MS120-24P MAC adresi).
