@@ -160,6 +160,7 @@ class ARPScanner:
 
         # Step 3: bounded ping sweep. Refresh ARP after each small batch.
         hosts = [str(host) for host in network.hosts()]
+        responded = set()
         batch_size = max(8, self.workers)
         for offset in range(0, len(hosts), batch_size):
             if self.cancelled:
@@ -170,7 +171,8 @@ class ARPScanner:
                 for future in as_completed(futures):
                     if self.cancelled:
                         break
-                    future.result()
+                    if future.result():
+                        responded.add(futures[future])
                     self.scan_progress += 1
                     if progress_callback:
                         progress_callback(self.scan_progress, self.total_devices)
@@ -183,8 +185,11 @@ class ARPScanner:
         devices = []
         for ip in sorted(entries, key=ipaddress.ip_address):
             entry = entries[ip]
-            method = methods.get(ip, "arp_table")
-            devices.append(self._device(entry, adapter, method))
+            method = "ping+arp" if ip in responded else methods.get(ip, "arp_table")
+            device = self._device(entry, adapter, method)
+            if ip in responded:
+                device["online"] = True
+            devices.append(device)
         return devices
 
     def find_mac(self, mac, cidr, selected_adapter_ip=None, progress_callback=None):
@@ -216,12 +221,14 @@ class ARPScanner:
             if self.cancelled:
                 break
             batch = hosts[offset:offset + batch_size]
+            responded = set()
             with ThreadPoolExecutor(max_workers=min(self.workers, len(batch) or 1)) as pool:
                 futures = {pool.submit(self._ping, host, self.timeout_ms): host for host in batch}
                 for future in as_completed(futures):
                     if self.cancelled:
                         break
-                    future.result()
+                    if future.result():
+                        responded.add(futures[future])
                     self.scan_progress += 1
                     if progress_callback:
                         progress_callback(self.scan_progress, self.total_devices)
@@ -230,6 +237,8 @@ class ARPScanner:
                 entries[ip] = entry
                 if macs_match(entry.get("mac"), target):
                     self.found_device = self._device(entry, adapter, "ping+arp")
+                    if ip in responded:
+                        self.found_device["online"] = True
                     return self.found_device
         self.found_device = None
         return None
