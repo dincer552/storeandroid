@@ -41,8 +41,8 @@ class MACFinderApp:
     def __init__(self, root):
         self.root = root
         self.root.title("MAC Finder Pro | Local Network Inventory")
-        self.root.geometry("1400x840")
-        self.root.minsize(1120, 700)
+        self.root.geometry("1280x800")
+        self.root.minsize(1040, 660)
         self.root.configure(bg=self.C["bg"])
         self.store = InventoryStore()
         self.adapters = []
