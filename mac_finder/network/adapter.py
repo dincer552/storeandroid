@@ -1,63 +1,95 @@
-"""Network adapter discovery helpers."""
+"""Windows/Linux adapter discovery using psutil and the OS route table."""
+import ipaddress
 import platform
 import re
-import subprocess
 import socket
+import subprocess
+
 import psutil
 
 
-def _default_gateway():
-    system = platform.system().lower()
-    command = ["route", "print", "-4"] if system == "windows" else ["ip", "route", "show", "default"]
+def _run(command):
     try:
-        output = subprocess.run(command, capture_output=True, text=True, timeout=4,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if system == "windows" else 0).stdout
-        if system == "windows":
-            for line in output.splitlines():
-                parts = line.split()
-                if len(parts) >= 3 and parts[:2] == ["0.0.0.0", "0.0.0.0"]:
-                    return parts[2]
-        else:
-            match = re.search(r"^default via (\S+)", output, re.M)
-            if match:
-                return match.group(1)
+        return subprocess.run(command, capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if platform.system().lower() == "windows" else 0).stdout
     except (OSError, subprocess.SubprocessError):
-        pass
-    return None
+        return ""
+
+
+def _default_gateways():
+    gateways = {}
+    if platform.system().lower() == "windows":
+        output = _run(["route", "print", "-4"])
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) >= 5 and parts[0] == "0.0.0.0" and parts[1] == "0.0.0.0":
+                try:
+                    ipaddress.IPv4Address(parts[2])
+                    ipaddress.IPv4Address(parts[3])
+                    gateways[parts[3]] = parts[2]
+                except ValueError:
+                    continue
+    else:
+        output = _run(["ip", "-4", "route", "show", "default"])
+        for line in output.splitlines():
+            via = re.search(r"\bvia\s+(\S+)", line)
+            dev = re.search(r"\bdev\s+(\S+)", line)
+            if via and dev:
+                gateways[dev.group(1)] = via.group(1)
+    return gateways
 
 
 def get_active_adapters():
-    """Return active non-loopback IPv4 adapters with OS-reported link details."""
+    """Return usable IPv4 interfaces and their OS-reported link metadata."""
     adapters = []
-    addrs = psutil.net_if_addrs()
+    addresses = psutil.net_if_addrs()
     stats = psutil.net_if_stats()
-    gateway = _default_gateway()
-    link_family = getattr(psutil, "AF_LINK", None)
-    for name, address_list in addrs.items():
+    gateways = _default_gateways()
+    link_family = getattr(psutil, "AF_LINK", getattr(socket, "AF_PACKET", None))
+
+    for name, address_list in addresses.items():
         state = stats.get(name)
         if not state or not state.isup:
             continue
-        ipv4 = next((addr for addr in address_list
-                     if addr.family == socket.AF_INET and addr.address and addr.netmask), None)
-        if not ipv4 or ipv4.address.startswith(("127.", "169.254.")):
+        ipv4 = next((address for address in address_list
+                     if address.family == socket.AF_INET and address.address and address.netmask), None)
+        if not ipv4:
             continue
-        mac = next((addr.address for addr in address_list
-                    if link_family is not None and addr.family == link_family), "Bilinmiyor")
         try:
-            prefixlen = sum(bin(int(octet)).count("1") for octet in ipv4.netmask.split("."))
-        except (AttributeError, ValueError):
-            prefixlen = 0
+            ip = ipaddress.IPv4Address(ipv4.address)
+            network = ipaddress.IPv4Network(f"{ipv4.address}/{ipv4.netmask}", strict=False)
+        except ValueError:
+            continue
+        if ip.is_loopback or ip.is_link_local:
+            continue
+
+        mac = "Bilinmiyor"
+        if link_family is not None:
+            mac = next((address.address.upper().replace("-", ":")
+                        for address in address_list
+                        if address.family == link_family and address.address), mac)
+        gateway = gateways.get(ipv4.address)
+        if not gateway and platform.system().lower() != "windows":
+            gateway = gateways.get(name)
         adapters.append({
-            "name": name, "ip": ipv4.address, "netmask": ipv4.netmask,
-            "prefixlen": prefixlen, "mac": mac, "gateway": gateway or "Bilinmiyor",
-            "speed_mbps": state.speed or 0, "mtu": state.mtu or 0,
-            "duplex": str(state.duplex), "is_up": state.isup
+            "name": name,
+            "ip": ipv4.address,
+            "netmask": ipv4.netmask,
+            "prefixlen": network.prefixlen,
+            "network": str(network),
+            "mac": mac,
+            "gateway": gateway or "Bilinmiyor",
+            "speed_mbps": int(state.speed or 0),
+            "mtu": int(state.mtu or 0),
+            "duplex": str(state.duplex),
+            "is_up": bool(state.isup),
         })
     return adapters
 
 
 def get_adapter_stats():
-    """Return per-interface byte and packet counters."""
+    """Per-interface traffic counters."""
     try:
         return psutil.net_io_counters(pernic=True)
     except Exception:
