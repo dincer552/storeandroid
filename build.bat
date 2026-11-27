@@ -14,6 +14,7 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 python -m compileall -q main.py mac_finder tests || exit /b 1
 python -m unittest discover -s tests -v || exit /b 1
+python -c "from mac_finder.gui.main_window import MACFinderApp; from mac_finder.inventory import InventoryStore; print('GUI and inventory imports OK')" || exit /b 1
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name MACFinder --collect-all psutil %SCAPY_FLAG% main.py
 if errorlevel 1 (echo BUILD FAILED.& pause & exit /b 1)
 if not exist dist\MACFinder.exe (echo EXE NOT FOUND.& pause & exit /b 1)
