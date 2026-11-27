@@ -1,5 +1,7 @@
 # Embedded MAC OUI registry for common vendors.
 # Maps OUI (uppercase, colon-separated first 3 octets) to vendor name.
+from ..network.mac import normalize_mac
+
 OUI_REGISTRY = {
     "B8:AB:61": "Cisco Meraki",
     "00:1E:13": "Cisco Meraki",

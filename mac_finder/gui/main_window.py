@@ -1,3 +1,4 @@
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 from ..network.adapter import get_active_adapters
