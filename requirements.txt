@@ -1,0 +1,9 @@
+# Core dependencies
+psutil>=5.9.0
+
+# Optional - for ARP scanning with Scapy
+# scapy>=2.5.0
+# Note: Scapy requires Npcap on Windows. If not available, falls back to system ARP/ping.
+
+# For building EXE
+# pyinstaller>=6.0.0
