@@ -4,7 +4,7 @@ sys.path.insert(0, '.')
 from mac_finder.config import Config
 from mac_finder.gui.main_window import MACFinderApp
 from mac_finder.gui.meraki_ui import MerakiUIManager, MS120_24P_SPEC
-from mac_finder.network.meraki import MerakiClient, find_switch_port_legacy
+from mac_finder.network.meraki import MerakiClient
 from mac_finder.network.snmp import SnmpClient, snmp_v3_available
 
 print("=== MAC Finder Pro - Import Test ===")

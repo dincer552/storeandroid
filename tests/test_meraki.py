@@ -1,191 +1,272 @@
 """Meraki API and MAC-to-port matching tests using mocked HTTP responses."""
+import io
+import json
+import tempfile
 import unittest
-from unittest.mock import patch, MagicMock
+import urllib.error
+from pathlib import Path
+from unittest.mock import MagicMock
 
-from mac_finder.network.meraki import MerakiClient
-from mac_finder.network.mac import normalize_mac
+from mac_finder.inventory.store import InventoryStore
+from mac_finder.network.inspector import MerakiInspector
+from mac_finder.network.meraki import (
+    MerakiAPIError,
+    MerakiClient,
+    normalize_mac_table,
+    normalize_poe_data,
+    normalize_traffic_data,
+    normalize_topology,
+)
+from mac_finder.network.security import SecureCredentialStore
 
 
-def _fake_response(payload):
-    resp = MagicMock()
-    resp.read.return_value = __import__("json").dumps(payload).encode("utf-8")
-    resp.__enter__ = lambda self: self
-    resp.__exit__ = lambda self, *a: False
-    return resp
+class FakeResponse:
+    def __init__(self, payload, headers=None):
+        self.payload = payload
+        self.headers = headers or {}
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
 
 
-class MerakiClientMockTests(unittest.TestCase):
+class MerakiClientTests(unittest.TestCase):
     def setUp(self):
-        self.client = MerakiClient("test-key", timeout=5, max_retries=0)
+        self.requests = []
+        self.responses = []
+        self.sleeps = []
 
-    def _patch_get(self, mapping):
-        """Patch urlopen so path -> payload. Match by normalized path (ignore query)."""
-        def fake_urlopen(request, timeout=None):
-            url = request.full_url
-            # Normalize: split off query string for path matching
-            if "?" in url:
-                path = url.split("?")[0]
-            else:
-                path = url
-            path = path.replace(MerakiClient.BASE_URL, "")
-            # Prefer the longest (most specific) matching prefix so that
-            # "/organizations" does not shadow "/organizations/111/devices".
-            for key in sorted(mapping, key=len, reverse=True):
-                if path == key or path.startswith(key):
-                    return _fake_response(mapping[key])
-            raise AssertionError(f"Unexpected URL path: {path}")
-        return patch("urllib.request.urlopen", side_effect=fake_urlopen)
+        def opener(request, timeout):
+            self.requests.append((request, timeout))
+            response = self.responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
 
-    def test_find_switch_by_mac_uses_inventory_filter(self):
-        mapping = {
-            "/organizations": [{"id": "111", "name": "Test Org"}],
-            "/organizations/111/devices": [
-                {
-                    "productType": "switch", "model": "MS120-24P",
-                    "serial": "Q4DE-57E5-WTP9", "mac": "B8:AB:61:AB:DA:6E",
-                    "name": "core-sw", "networkId": "N_1", "lanIp": "10.0.0.2",
-                    "firmware": "MS 14.40", "tags": ["core"],
-                    "address": "HQ", "notes": "",
-                }
-            ],
-        }
-        with self._patch_get(mapping):
-            found = self.client.find_switch_by_identifier("B8:AB:61:AB:DA:6E")
-        self.assertEqual(len(found), 1)
-        self.assertEqual(found[0]["serial"], "Q4DE-57E5-WTP9")
-        self.assertEqual(found[0]["model"], "MS120-24P")
-        self.assertEqual(normalize_mac(found[0]["mac"]), "B8:AB:61:AB:DA:6E")
+        self.client = MerakiClient(
+            "test-secret", opener=opener, sleep=self.sleeps.append,
+            requests_per_second=10, max_retries=2,
+        )
+        self.client._throttle = MagicMock()
+        self.client._throttle_live_tool = MagicMock()
 
-    def test_find_switch_by_serial_and_model(self):
-        mapping = {
-            "/organizations": [{"id": "111", "name": "Test Org"}],
-            "/organizations/111/devices": [
-                {"productType": "switch", "model": "MS120-24P", "serial": "Q4DE-57E5-WTP9",
-                 "mac": "B8:AB:61:AB:DA:6E", "networkId": "N_1"},
-            ],
-        }
-        with self._patch_get(mapping):
-            by_serial = self.client.find_switch_by_identifier("Q4DE-57E5-WTP9")
-            by_model = self.client.find_switch_by_identifier("MS120-24P")
-        self.assertEqual(len(by_serial), 1)
-        self.assertEqual(len(by_model), 1)
+    def test_uses_api_key_header_and_supported_inventory_filters(self):
+        self.responses.append(FakeResponse([{
+            "serial": "Q4DE-57E5-WTP9", "mac": "B8:AB:61:AB:DA:6E",
+            "model": "MS120-24P", "productType": "switch",
+        }]))
+        devices = self.client.organization_devices("42", filters={"mac": "b8ab.61ab.da6e"})
+        request = self.requests[0][0]
+        self.assertEqual(request.get_header("X-cisco-meraki-api-key"), "test-secret")
+        self.assertIn("mac=B8%3AAB%3A61%3AAB%3ADA%3A6E", request.full_url)
+        self.assertEqual(devices[0]["model"], "MS120-24P")
 
-    def test_find_client_port_network_clients(self):
-        mapping = {
-            "/organizations": [{"id": "111", "name": "Test Org"}],
-            "/organizations/111/networks": [{"id": "N_1", "name": "Main"}],
-            "/networks/N_1/clients": [
-                {
-                    "mac": "b8:ab:61:ab:da:6e", "ip": "10.0.0.50",
-                    "manufacturer": "Cisco Meraki", "status": "Online",
-                    "switchport": "Port 12", "vlan": 10,
-                    "recentDeviceSerial": "Q4DE-57E5-WTP9",
-                }
-            ],
-            "/organizations/111/devices": [],
-        }
-        with self._patch_get(mapping):
-            result = self.client.find_client_port_by_mac("B8:AB:61:AB:DA:6E")
-        self.assertIsNotNone(result["best_match"])
-        self.assertEqual(result["best_match"]["source"], "network_clients")
-        self.assertEqual(result["best_match"]["ip"], "10.0.0.50")
-        self.assertEqual(result["best_match"]["vlan"], 10)
-        self.assertEqual(result["best_match"]["switchport"], "Port 12")
+    def test_follows_link_header_pagination(self):
+        first = "https://api.meraki.com/api/v1/organizations/42/devices?perPage=1000"
+        following = first + "&startingAfter=token"
+        self.responses.extend([
+            FakeResponse([{"serial": "A"}], {"Link": f'<{following}>; rel="next"'}),
+            FakeResponse([{"serial": "B"}]),
+        ])
+        result = self.client.organization_devices("42")
+        self.assertEqual([item["serial"] for item in result], ["A", "B"])
+        self.assertEqual(self.requests[1][0].full_url, following)
 
-    def test_find_client_port_mac_table_live_tool(self):
-        client = self.client
-        client.mac_table_create = MagicMock(return_value={"id": "job1"})
-        client.mac_table_get = MagicMock(return_value={
-            "status": "complete",
-            "entries": [{"mac": "B8:AB:61:AB:DA:6E", "port": "Port 5", "vlanId": 20}],
-        })
-        client.device_clients = MagicMock(return_value=[])
+    def test_short_term_cache_avoids_duplicate_requests(self):
+        self.responses.append(FakeResponse([{"id": "1", "name": "Org"}]))
+        self.assertEqual(self.client.organizations(), self.client.organizations())
+        self.assertEqual(len(self.requests), 1)
 
-        mapping = {
-            "/organizations": [{"id": "111", "name": "Test Org"}],
-            "/organizations/111/networks": [{"id": "N_1", "name": "Main"}],
-            "/networks/N_1/clients": [],
-            "/organizations/111/devices": [
-                {"productType": "switch", "model": "MS120-24P",
-                 "serial": "Q4DE-57E5-WTP9", "name": "sw1", "networkId": "N_1"},
-            ],
-        }
-        with self._patch_get(mapping):
-            result = client.find_client_port_by_mac("B8:AB:61:AB:DA:6E")
-        self.assertIsNotNone(result["best_match"])
-        self.assertEqual(result["best_match"]["source"], "mac_table")
-        self.assertEqual(result["best_match"]["port"], "Port 5")
-        self.assertEqual(result["best_match"]["vlan_id"], 20)
+    def test_retry_after_is_used_for_rate_limit(self):
+        error = urllib.error.HTTPError(
+            "https://api.meraki.com/api/v1/organizations", 429, "Too Many Requests",
+            {"Retry-After": "2"}, io.BytesIO(b'{"errors":["slow down"]}'),
+        )
+        self.responses.extend([error, FakeResponse([])])
+        self.assertEqual(self.client.organizations(), [])
+        self.assertIn(2.0, self.sleeps)
 
-    def test_no_match_returns_empty_sources(self):
-        mapping = {
-            "/organizations": [{"id": "111", "name": "Test Org"}],
-            "/organizations/111/networks": [],
-        }
-        with self._patch_get(mapping):
-            result = self.client.find_client_port_by_mac("AA:BB:CC:DD:EE:FF")
-        self.assertEqual(result["sources"], [])
-        self.assertIsNone(result["best_match"])
+    def test_401_403_and_404_have_actionable_messages(self):
+        for status, text in {401: "anahtarı", 403: "izni", 404: "bulunamadı"}.items():
+            with self.subTest(status=status):
+                client = MerakiClient("secret", opener=MagicMock(), max_retries=0)
+                client._throttle = MagicMock()
+                client._opener.side_effect = urllib.error.HTTPError(
+                    "https://api.meraki.com/api/v1/test", status, "error", {},
+                    io.BytesIO(b'{"message":"denied"}'),
+                )
+                with self.assertRaises(MerakiAPIError) as caught:
+                    client.get("/test")
+                self.assertEqual(caught.exception.status, status)
+                self.assertIn(text, str(caught.exception))
 
-    def test_429_retry_then_success(self):
-        import urllib.error
-        calls = {"n": 0}
+    def test_mac_table_is_async_and_filters_entries(self):
+        target = "B8:AB:61:AB:DA:6E"
+        self.responses.extend([
+            FakeResponse({"macTableId": "job-1", "status": "new"}),
+            FakeResponse({"macTableId": "job-1", "status": "running"}),
+            FakeResponse({
+                "macTableId": "job-1", "status": "complete",
+                "entries": [
+                    {"mac": target.lower(), "port": "5", "vlanId": 100},
+                    {"mac": "00:11:22:33:44:55", "port": "6", "vlanId": 200},
+                ],
+            }),
+        ])
+        result = self.client.query_mac_table("Q4DE-57E5-WTP9", "b8ab.61ab.da6e", interval=0.5)
+        self.assertEqual(json.loads(self.requests[0][0].data.decode()), {"mac": target})
+        self.assertIn("/liveTools/macTable/job-1", self.requests[-1][0].full_url)
+        self.assertEqual(len(result["entries"]), 1)
+        self.assertEqual((result["entries"][0]["port"], result["entries"][0]["vlan_id"]), ("5", 100))
 
-        def fake_urlopen(request, timeout=None):
-            calls["n"] += 1
-            if calls["n"] == 1:
-                raise urllib.error.HTTPError(
-                    request.full_url, 429, "Too Many Requests", {"Retry-After": "0"}, None)
-            return _fake_response([{"id": "1"}])
+    def test_port_status_does_not_supply_client_mac_mapping(self):
+        self.responses.extend([
+            FakeResponse([{"id": "org-1", "name": "Test Org"}]),
+            FakeResponse([{
+                "serial": "Q4DE-57E5-WTP9", "networkId": "N_1",
+                "productType": "switch", "model": "MS120-24P",
+            }]),
+            FakeResponse([{
+                "id": "k74272e", "mac": "B8:AB:61:AB:DA:6E", "ip": "192.168.7.20",
+                "status": "Online", "switchport": "7", "vlan": "100", "namedVlan": "Users",
+                "recentDeviceConnection": "Wired", "recentDeviceSerial": "Q4DE-57E5-WTP9",
+                "recentDeviceName": "Core Switch", "usage": {"sent": 12, "recv": 34},
+            }]),
+        ])
+        result = self.client.find_switch_port("B8:AB:61:AB:DA:6E")
+        self.assertEqual((result["port_id"], result["client_ip"], result["vlan"]), ("7", "192.168.7.20", "100"))
+        self.assertFalse(any("/switch/ports/statuses" in request.full_url for request, _ in self.requests))
 
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            client = MerakiClient("k", timeout=5, max_retries=2)
-            result = client.organizations()
-        self.assertEqual(result, [{"id": "1"}])
-        self.assertEqual(calls["n"], 2)
-
-    def test_401_error_message(self):
-        import urllib.error
-        def fake_urlopen(request, timeout=None):
-            raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            with self.assertRaises(RuntimeError) as ctx:
-                self.client.organizations()
-        self.assertIn("401", str(ctx.exception))
-        self.assertIn("anahtar", str(ctx.exception).lower())
-
-    def test_403_error_message(self):
-        import urllib.error
-        def fake_urlopen(request, timeout=None):
-            raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-            with self.assertRaises(RuntimeError) as ctx:
-                self.client.organizations()
-        self.assertIn("403", str(ctx.exception))
-        self.assertIn("yetki", str(ctx.exception).lower())
-
-    def test_switch_ports_statuses_fields(self):
-        mapping = {
-            "/devices/Q4DE-57E5-WTP9/switch/ports/statuses": [
-                {"portId": "1", "link": "up", "speed": "1 Gbps", "duplex": "full",
-                 "isUplink": False, "poeEnabled": True, "powerUsageInWh": 12.5,
-                 "vlan": 10, "clientCount": 1, "status": "connected"},
-            ],
-        }
-        with self._patch_get(mapping):
-            statuses = self.client.switch_ports_statuses("Q4DE-57E5-WTP9")
+    def test_switch_ports_statuses_alias(self):
+        self.responses.append(FakeResponse([{"portId": "1", "status": "Connected"}]))
+        statuses = self.client.switch_ports_statuses("Q4DE-57E5-WTP9")
         self.assertEqual(statuses[0]["portId"], "1")
-        self.assertIn("poeEnabled", statuses[0])
-        self.assertIn("powerUsageInWh", statuses[0])
 
-    def test_rate_limit_interval_enforced(self):
-        import time
-        client = MerakiClient("k", timeout=5)
-        start = time.monotonic()
-        client._throttle()
-        client._throttle()
-        elapsed = time.monotonic() - start
-        self.assertGreaterEqual(elapsed, 0.10)
+    def test_vlan_poe_and_energy_units_are_preserved(self):
+        rows = MerakiClient.normalize_ports(
+            [{"portId": "1", "vlan": 10, "nativeVlan": 1, "allowedVlans": "1-4094", "poeEnabled": True}],
+            [{"portId": "1", "status": "Connected", "poe": {"isAllocated": True}, "powerUsageInWh": 55.9}],
+        )
+        self.assertEqual(rows[0]["config"]["vlan"], 10)
+        self.assertTrue(rows[0]["poe"]["isAllocated"])
+        power = normalize_poe_data(
+            rows, {"status": "complete", "results": {"instant": 82.5, "peak": 120.0}},
+            manufacturer_budget=370,
+        )
+        self.assertEqual(power["per_port"][0]["power_usage_wh"], 55.9)
+        self.assertIsNone(power["per_port"][0]["instant_watts"])
+        self.assertEqual((power["instant_w"], power["remaining_w"]), (82.5, 287.5))
+        traffic = normalize_traffic_data(rows, [{
+            "portId": "1", "packets": [{"desc": "Total", "total": 100, "sent": 70, "recv": 30,
+                                        "ratePerSec": {"total": 2, "sent": 1, "recv": 1}}],
+        }], retrieved_at=123.0)
+        self.assertEqual((traffic[0]["packets_total"], traffic[0]["rate_total"]), (100, 2))
+        self.assertIn("son 5 dakika", traffic[0]["freshness"])
+
+    def test_topology_draws_only_two_ended_discovered_links(self):
+        result = normalize_topology({
+            "nodes": [
+                {"derivedId": "a", "type": "device", "device": {"name": "Switch A"}},
+                {"derivedId": "b", "type": "device", "device": {"name": "Switch B"}},
+            ],
+            "links": [
+                {"ends": [{"node": {"derivedId": "a"}, "discovered": {"lldp": {"portId": "1"}}},
+                          {"node": {"derivedId": "b"}, "discovered": {"cdp": {"portId": "2", "nativeVlan": 10}}}]},
+                {"ends": [{"node": {"derivedId": "a"}}]},
+            ],
+        })
+        self.assertEqual(len(result["links"]), 1)
+        self.assertEqual(result["links"][0]["a_port"], "1")
+        self.assertEqual(result["links"][0]["b_vlan"], 10)
+
+
+class DiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.target = "B8:AB:61:AB:DA:6E"
+        self.device = {"serial": "Q4DE-57E5-WTP9", "mac": self.target, "model": "MS120-24P",
+                       "productType": "switch", "networkId": "N_1", "lanIp": "192.168.7.2",
+                       "name": "Core Switch", "firmware": "MS 17.0"}
+
+    def test_discovery_reports_every_source_without_inventing_identity(self):
+        device = self.device
+
+        class Client:
+            def organizations(self):
+                return [{"id": "org-1", "name": "Test Org"}]
+
+            def organization_devices(self, organization_id, filters=None, network_ids=None):
+                return [device]
+
+        class Scanner:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def find_mac(self, *args, **kwargs):
+                return None
+
+        with tempfile.TemporaryDirectory() as folder:
+            store = InventoryStore(Path(folder) / "inventory.db")
+            inspector = MerakiInspector(
+                client=Client(), store=store,
+                arp_provider=lambda: [{"ip": "192.168.7.2", "mac": self.target}],
+                scanner_factory=Scanner,
+                status_provider=lambda: {"reachable": False, "error": "DNS yok"},
+            )
+            result = inspector.discover(self.target, "192.168.7.0/24", "192.168.7.10")
+            self.assertEqual(result["selected_device"]["serial"], "Q4DE-57E5-WTP9")
+            self.assertEqual([item["source"] for item in result["evidence"]], [
+                "SQLite envanteri", "Yerel ARP", "Yerel subnet", "Meraki API",
+                "Yerel SNMP", "Local Status Page",
+            ])
+            self.assertEqual(store.get_meraki_device("Q4DE-57E5-WTP9")["model"], "MS120-24P")
+
+    def test_conflicting_mac_sources_are_all_returned_with_timestamps(self):
+        target = self.target
+
+        class Client:
+            def network_clients(self, network_id, mac=None):
+                return [{"mac": target, "ip": "192.168.7.20", "switchport": "5", "vlan": "100",
+                         "recentDeviceConnection": "Wired", "recentDeviceSerial": "Q4DE-57E5-WTP9",
+                         "recentDeviceName": "Core"}]
+
+            def device_clients(self, serial):
+                return []
+
+            def query_mac_table(self, serial, mac, **kwargs):
+                return {"entries": [{"mac": mac, "port": "6", "vlan_id": 200,
+                                     "observed_at": 200.0, "raw": {}}]}
+
+        result = MerakiInspector(client=Client(), arp_provider=lambda: []).locate_mac(
+            target, self.device, include_forwarding=True)
+        self.assertTrue(result["found"])
+        self.assertEqual({item["port"] for item in result["mappings"]}, {"5", "6"})
+        self.assertTrue(all(item["observed_at"] for item in result["mappings"]))
+        self.assertEqual({item["source"] for item in result["mappings"]}, {
+            "Meraki network client", "Switch MAC forwarding table",
+        })
+
+    def test_mac_table_normalizer_accepts_official_port_field(self):
+        result = normalize_mac_table({"status": "complete", "entries": [
+            {"mac": self.target, "port": "24", "vlanId": 20},
+        ]}, self.target)
+        self.assertEqual(result["entries"][0]["port"], "24")
+
+
+class CredentialTests(unittest.TestCase):
+    def test_dpapi_roundtrip_never_writes_plaintext(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = SecureCredentialStore(Path(folder))
+            secret = "never-store-this-plaintext-api-key"
+            store.save("meraki_api_key", secret)
+            self.assertEqual(store.load("meraki_api_key"), secret)
+            self.assertNotIn(secret.encode(), (Path(folder) / "meraki_api_key.dpapi").read_bytes())
+            store.delete("meraki_api_key")
+            self.assertEqual(store.load("meraki_api_key"), "")
 
 
 if __name__ == "__main__":

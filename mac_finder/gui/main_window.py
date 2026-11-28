@@ -14,6 +14,7 @@ from ..network.adapter import get_active_adapters, get_adapter_stats
 from ..network.mac import normalize_mac
 from ..network.meraki import MerakiClient
 from ..network.snmp import SnmpClient
+from ..network.security import SecureCredentialStore
 from ..gui.meraki_ui import MerakiUIManager
 from ..network.scanner import ARPScanner
 
@@ -48,6 +49,7 @@ class MACFinderApp:
         self.root.minsize(1040, 660)
         self.root.configure(bg=self.C["bg"])
         self.store = InventoryStore()
+        self.credentials = SecureCredentialStore()
         self.adapters = []
         self.adapter_map = {}
         self.devices = []
@@ -103,16 +105,27 @@ class MACFinderApp:
                  fg=self.C["muted"], font=("Segoe UI", 7)).pack(anchor="w", pady=(2, 0))
         tk.Frame(self.sidebar, bg=self.C["line"], height=1).pack(fill="x", padx=15, pady=(0, 12))
 
+        nav_host = tk.Frame(self.sidebar, bg=self.C["sidebar"])
+        nav_host.pack(fill="both", expand=True)
+        nav_canvas = tk.Canvas(nav_host, bg=self.C["sidebar"], highlightthickness=0, width=228)
+        nav_scroll = ttk.Scrollbar(nav_host, orient="vertical", command=nav_canvas.yview)
+        nav_inner = tk.Frame(nav_canvas, bg=self.C["sidebar"])
+        nav_canvas.configure(yscrollcommand=nav_scroll.set)
+        nav_canvas.pack(side="left", fill="both", expand=True)
+        nav_scroll.pack(side="right", fill="y")
+        nav_canvas.create_window((0, 0), window=nav_inner, anchor="nw", width=210)
+        nav_inner.bind("<Configure>", lambda event: nav_canvas.configure(scrollregion=nav_canvas.bbox("all")))
+        nav_canvas.bind("<MouseWheel>", lambda event: nav_canvas.yview_scroll(-int(event.delta / 120), "units"))
         self.nav_buttons = {}
         for group, items in self.NAV:
-            tk.Label(self.sidebar, text=group, bg=self.C["sidebar"], fg="#657b99",
+            tk.Label(nav_inner, text=group, bg=self.C["sidebar"], fg="#657b99",
                      font=("Segoe UI Semibold", 8)).pack(anchor="w", padx=20, pady=(12, 6))
             for name, glyph in items:
                 button = tk.Button(
-                    self.sidebar, text=f"   {glyph}     {name}", anchor="w",
+                    nav_inner, text=f"   {glyph}     {name}", anchor="w",
                     bd=0, bg=self.C["sidebar"], fg=self.C["muted"],
                     activebackground=self.C["panel2"], activeforeground=self.C["text"],
-                    font=("Segoe UI", 9), padx=9, pady=10,
+                    font=("Segoe UI", 9), padx=9, pady=8,
                     command=lambda page=name: self.show_page(page),
                     cursor="hand2", highlightthickness=0, relief="flat"
                 )
@@ -667,327 +680,6 @@ class MACFinderApp:
             self.active_scanner.cancel()
             self.status_var.set("Tarama durduruluyor…")
 
-    def _poll_events(self):
-        try:
-            while True:
-                item = self.events.get_nowait()
-                kind = item[0]
-                if kind == "progress":
-                    done, total = item[1], item[2]
-                    pct = (done / total * 100) if total else 100
-                    if hasattr(self, "progress_var"):
-                        self.progress_var.set(pct)
-                        self.progress_text.config(text=f"Kontrol edilen: {done:,} / {total:,} host  ·  %{pct:.0f}")
-                    self.status_var.set(f"Ağ keşfi · {done:,} / {total:,} host")
-                elif kind == "error":
-                    task, error = item[1], item[2]
-                    self.activity_label.config(text="ERROR", fg=self.C["red"])
-                    self.status_var.set(f"{task}: {error}")
-                    if hasattr(self, "progress_text") and self.progress_text.winfo_exists():
-                        self.progress_text.config(text="Hata: " + error)
-                    messagebox.showerror("İşlem hatası", error)
-                elif kind == "result":
-                    task, result = item[1], item[2]
-                    self.activity_label.config(text="COMPLETE", fg=self.C["green"])
-                    if task == "MAC arama":
-                        device = result["device"]
-                        if device:
-                            label = f"BULUNDU  ·  {device['ip']}  ·  {device['mac']}"
-                            self.mac_result_label.config(text=label, fg=self.C["green"])
-                            if result["new_count"] and self.notify_var.get():
-                                self.root.bell()
-                            self.status_var.set("MAC adresi bulundu ve envantere kaydedildi")
-                        else:
-                            self.mac_result_label.config(
-                                text=f"Bulunamadı · {result['mac']} · Bu subnet içinde eşleşen ARP kaydı alınamadı",
-                                fg=self.C["amber"])
-                            self.status_var.set("MAC adresi bu yerel subnet'te bulunamadı")
-                        self.progress_var.set(100)
-                        self.progress_text.config(text="MAC arama tamamlandı")
-                    elif task == "Tüm ağ taraması":
-                        devices = result["devices"]
-                        self.devices = devices
-                        self.scan_summary.config(
-                            text=f"Tamamlandı · {len(devices)} cihaz bulundu · {result['new_count']} yeni cihaz · {result['cidr']}",
-                            fg=self.C["green"])
-                        self.progress_var.set(100)
-                        self.progress_text.config(text="Tarama tamamlandı")
-                        if result["new_count"] and self.notify_var.get():
-                            self.root.bell()
-                        self.status_var.set(
-                            f"Tarama tamamlandı · {len(devices)} cihaz · {result['new_count']} yeni kayıt")
-                    self._refresh_visible_data()
-        except queue.Empty:
-            pass
-        self.root.after(100, self._poll_events)
-
-    def _refresh_visible_data(self):
-        if self.current_page == "Cihaz Envanteri":
-            self._refresh_inventory()
-        elif self.current_page == "Dashboard":
-            self.show_page("Dashboard")
-
-    def _export_records(self):
-        query = ""
-        if self.current_page == "Cihaz Envanteri" and hasattr(self, "search_widget"):
-            query = self.search_widget.get().strip()
-            if query.startswith("MAC, IP, hostname"):
-                query = ""
-        records = self.store.get_all(query)
-        if self.current_page == "Cihaz Envanteri":
-            mode = self.filter_var.get()
-            if mode == "Online":
-                records = [row for row in records if row["online"]]
-            elif mode == "Offline":
-                records = [row for row in records if not row["online"]]
-        return records
-
-    def _export_inventory(self, kind):
-        records = self._export_records()
-        if not records:
-            messagebox.showinfo("Boş envanter", "Dışa aktarılacak cihaz kaydı yok.")
-            return
-        types = [("CSV", "*.csv")] if kind == "csv" else [("JSON", "*.json")]
-        path = filedialog.asksaveasfilename(
-            defaultextension="." + kind, filetypes=types,
-            initialfile=f"macfinder_inventory.{kind}"
-        )
-        if not path:
-            return
-        if kind == "json":
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(records, handle, ensure_ascii=False, indent=2)
-        else:
-            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(records[0].keys()))
-                writer.writeheader()
-                writer.writerows(records)
-        self.status_var.set(f"{len(records)} cihaz {kind.upper()} olarak dışa aktarıldı")
-
-    def _page_adapters(self):
-        self._section(self.content, "Ağ Adaptörleri",
-            "psutil ve Windows ağ yığınından okunan gerçek arayüz bilgileri")
-        panel = self._panel(self.content)
-        if not self.adapters:
-            self._label(panel, "Aktif IPv4 adaptörü bulunamadı", self.C["amber"]).pack(anchor="w")
-            return
-        counters = get_adapter_stats()
-        for adapter in self.adapters:
-            card = tk.Frame(panel, bg=self.C["panel2"], padx=15, pady=12)
-            card.pack(fill="x", pady=5)
-            tk.Label(card, text=adapter["name"], bg=self.C["panel2"], fg=self.C["text"],
-                     font=("Segoe UI Semibold", 11)).pack(anchor="w")
-            tk.Label(card,
-                text=f"IPv4  {adapter['ip']} / {adapter['prefixlen']}     MAC  {adapter['mac']}",
-                bg=self.C["panel2"], fg=self.C["cyan"], font=("Consolas", 9)).pack(anchor="w", pady=5)
-            tk.Label(card,
-                text=f"Subnet  {adapter['network']}     Gateway  {adapter['gateway']}",
-                bg=self.C["panel2"], fg=self.C["text"], font=("Segoe UI", 8)).pack(anchor="w")
-            tk.Label(card,
-                text=f"Link  {adapter['speed_mbps']} Mbps     MTU  {adapter['mtu']}     Duplex  {adapter['duplex']}",
-                bg=self.C["panel2"], fg=self.C["muted"], font=("Segoe UI", 8)).pack(anchor="w", pady=(5, 0))
-            counter = counters.get(adapter["name"])
-            if counter:
-                tk.Label(card,
-                    text=f"RX {counter.bytes_recv:,} bytes   ·   TX {counter.bytes_sent:,} bytes",
-                    bg=self.C["panel2"], fg=self.C["muted"], font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 0))
-
-    def _page_meraki(self):
-        self._section(self.content, "Cisco Meraki API",
-            "İsteğe bağlı salt-okunur Dashboard API sorgusu · API anahtarı diske kaydedilmez")
-        panel = self._panel(self.content)
-        tk.Label(panel, text="DASHBOARD API KEY", bg=self.C["panel"], fg=self.C["muted"],
-                 font=("Segoe UI Semibold", 7)).pack(anchor="w")
-        self.meraki_key_entry = self._entry(panel, "", 65)
-        self.meraki_key_entry.config(show="•")
-        self.meraki_key_entry.pack(anchor="w", ipady=7, pady=(4, 12))
-        tk.Label(panel, text="ARANACAK İSTEMCİ MAC", bg=self.C["panel"], fg=self.C["muted"],
-                 font=("Segoe UI Semibold", 7)).pack(anchor="w")
-        self.meraki_mac_entry = self._entry(panel, Config.get_test_mac(), 30)
-        self.meraki_mac_entry.pack(anchor="w", ipady=7, pady=(4, 12))
-        self._button(panel, "Meraki switch portlarında ara", self._start_meraki_lookup).pack(anchor="w")
-        self.meraki_status = tk.Label(panel, text="API bağlantısı yapılmadı",
-            bg=self.C["panel"], fg=self.C["muted"], font=("Segoe UI", 9), anchor="w")
-        self.meraki_status.pack(fill="x", pady=(15, 8))
-        self.meraki_result = tk.Text(panel, height=12, bg="#0b172a", fg=self.C["text"],
-            insertbackground=self.C["text"], relief="flat", font=("Consolas", 9),
-            highlightthickness=1, highlightbackground=self.C["line"], wrap="word")
-        self.meraki_result.pack(fill="both", expand=True)
-        self.meraki_result.insert("1.0",
-            "Bu özellik, erişiminiz olan Meraki kuruluşlarını ve switch port status kayıtlarını sorgular.\n"
-            "Port/client MAC alanı API tarafından döndürülmüyorsa eşleşme bulunamaz.\n"
-            "API key yalnızca bellekte tutulur; ayarlara veya SQLite veritabanına yazılmaz.")
-        self.meraki_result.config(state="disabled")
-
-    def _start_meraki_lookup(self):
-        key = self.meraki_key_entry.get().strip()
-        mac = normalize_mac(self.meraki_mac_entry.get())
-        if not key:
-            messagebox.showwarning("API key gerekli", "Cisco Meraki Dashboard API anahtarını girin.")
-            return
-        if not mac:
-            messagebox.showerror("Geçersiz MAC", "Geçerli bir MAC adresi girin.")
-            return
-        def task():
-            return MerakiClient(key).find_switch_port(mac)
-        self._start_worker("Meraki port arama", task)
-
-    def _page_settings(self):
-        self._section(self.content, "Ayarlar", "Envanter ve tarama tercihleri")
-        panel = self._panel(self.content)
-        check = tk.Checkbutton(panel, text="Yeni cihaz bulunduğunda sesli uyarı ver",
-            variable=self.notify_var, command=lambda: self.store.set_setting(
-                "notify_new", "1" if self.notify_var.get() else "0"),
-            bg=self.C["panel"], fg=self.C["text"], selectcolor=self.C["panel2"],
-            activebackground=self.C["panel"], activeforeground=self.C["text"],
-            font=("Segoe UI", 9))
-        check.pack(anchor="w", pady=(0, 14))
-        tk.Label(panel, text="SQLite veritabanı konumu", bg=self.C["panel"],
-                 fg=self.C["muted"], font=("Segoe UI Semibold", 8)).pack(anchor="w")
-        tk.Label(panel, text=str(self.store.path), bg=self.C["panel"],
-                 fg=self.C["cyan"], font=("Consolas", 9), wraplength=850,
-                 justify="left").pack(anchor="w", pady=(5, 14))
-        tk.Label(panel,
-            text="Ağ taraması sadece seçilen IPv4 subnet'iyle sınırlıdır (maksimum 4.096 host). "
-                 "Port tarama, packet injection, monitor mode, deauth veya saldırı özelliği bulunmaz.",
-            bg=self.C["panel"], fg=self.C["muted"], font=("Segoe UI", 8),
-            wraplength=900, justify="left").pack(anchor="w")
-
-    def _poll_events(self):
-        try:
-            while True:
-                item = self.events.get_nowait()
-                kind = item[0]
-                if kind == "progress":
-                    done, total = item[1], item[2]
-                    percent = (done / total * 100) if total else 0
-                    if hasattr(self, "progress") and self.progress.winfo_exists():
-                        self.progress.configure(mode="determinate")
-                        self.progress["maximum"] = 100
-                        self.progress["value"] = percent
-                        self.progress_text.config(
-                            text=f"Kontrol edilen host: {done:,} / {total:,}  ·  %{percent:.0f}")
-                    self.status_var.set(f"Tarama devam ediyor · {done:,}/{total:,} host")
-                elif kind == "error":
-                    task, error = item[1], item[2]
-                    self.activity_label.config(text="ERROR", fg=self.C["red"])
-                    self.status_var.set(f"{task}: {error}")
-                    if hasattr(self, "progress_text") and self.progress_text.winfo_exists():
-                        self.progress_text.config(text="Hata: " + error)
-                    messagebox.showerror("İşlem hatası", error)
-                elif kind == "result":
-                    task, result = item[1], item[2]
-                    self.activity_label.config(text="COMPLETE", fg=self.C["green"])
-                    if task == "MAC arama":
-                        device = result["device"]
-                        if device:
-                            self.mac_result_label.config(
-                                text=f"BULUNDU  ·  {device['ip']}  ·  {device['mac']}",
-                                fg=self.C["green"])
-                            if result["new_count"] and self.notify_var.get():
-                                self.root.bell()
-                            self.status_var.set("MAC eşleşti ve kalıcı envantere kaydedildi")
-                        else:
-                            self.mac_result_label.config(
-                                text=f"Bulunamadı · {result['mac']} · Seçilen yerel subnet'te ARP eşleşmesi yok",
-                                fg=self.C["amber"])
-                            self.status_var.set("Hedef MAC bu subnet'te bulunamadı")
-                        if hasattr(self, "progress_var"):
-                            self.progress_var.set(100)
-                            self.progress_text.config(text="MAC arama tamamlandı")
-                    elif task == "Tüm ağ taraması":
-                        if self.current_page == "Tüm Ağı Tara" and self.scan_summary.winfo_exists():
-                            summary = "Durduruldu" if result.get("cancelled") else "Tamamlandı"
-                            self.scan_summary.config(
-                                text=(f"{summary} · {len(result['devices'])} cihaz · "
-                                      f"{result['new_count']} yeni kayıt · {result['cidr']}"),
-                                fg=self.C["amber"] if result.get("cancelled") else self.C["green"])
-                        if result["new_count"] and self.notify_var.get():
-                            self.root.bell()
-                        if self.current_page == "Tüm Ağı Tara" and hasattr(self, "progress_text") and self.progress_text.winfo_exists():
-                            self.progress_var.set(100)
-                            self.progress_text.config(text="Tamamlandı" if not result.get("cancelled") else "Tarama durduruldu")
-                        self.status_var.set(
-                            f"Ağ taraması tamamlandı · {len(result['devices'])} cihaz bulundu")
-                    elif task == "Meraki port arama" and self.current_page == "Meraki API":
-                        self._show_meraki_result(result)
-                    self._refresh_visible_data()
-        except queue.Empty:
-            pass
-        self.root.after(100, self._poll_events)
-
-    def _show_meraki_result(self, result):
-        self.meraki_result.config(state="normal")
-        self.meraki_result.delete("1.0", "end")
-        if result:
-            lines = [
-                f"Organization : {result.get('organization')}",
-                f"Switch       : {result.get('switch_name')}",
-                f"Model        : {result.get('model')}",
-                f"Serial       : {result.get('serial')}",
-                f"Switch MAC   : {result.get('switch_mac')}",
-                f"Port         : {result.get('port_id')}",
-                f"Client MAC   : {result.get('client_mac')}",
-                f"Status       : {result.get('status')}",
-                f"VLAN         : {result.get('vlan')}",
-                f"PoE enabled  : {result.get('poe_enabled')}",
-                f"Power usage  : {result.get('power_usage')}",
-                f"Network ID   : {result.get('network_id')}",
-            ]
-            self.meraki_result.insert("1.0", "\n".join(lines))
-            self.meraki_status.config(text="İstemci MAC adresi switch portunda bulundu",
-                                      fg=self.C["green"])
-        else:
-            self.meraki_result.insert("1.0",
-                "Eşleşen client MAC içeren switch port durumu bulunamadı.\n"
-                "Olası nedenler: cihaz başka VLAN'da, clientMac alanı API'de yok, "
-                "API anahtarının izinleri yetersiz veya cihaz şu anda porta bağlı değil.")
-            self.meraki_status.config(text="Port eşleşmesi bulunamadı", fg=self.C["amber"])
-        self.meraki_result.config(state="disabled")
-
-    def _refresh_visible_data(self):
-        if self.current_page == "Cihaz Envanteri":
-            self._refresh_inventory()
-        elif self.current_page == "Dashboard":
-            self.show_page("Dashboard")
-
-    def _export_records(self):
-        if self.current_page == "Cihaz Envanteri" and hasattr(self, "search_widget"):
-            query = self.search_widget.get().strip()
-            if query.startswith("MAC, IP, hostname"):
-                query = ""
-        else:
-            query = ""
-        records = self.store.get_all(query)
-        if self.current_page == "Cihaz Envanteri":
-            mode = self.filter_var.get()
-            if mode == "Online":
-                records = [row for row in records if row["online"]]
-            elif mode == "Offline":
-                records = [row for row in records if not row["online"]]
-        return records
-
-    def _export_inventory(self, kind):
-        records = self._export_records()
-        if not records:
-            messagebox.showinfo("Envanter boş", "Dışa aktarılacak cihaz kaydı yok.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension="." + kind,
-            filetypes=[("CSV", "*.csv")] if kind == "csv" else [("JSON", "*.json")],
-            initialfile=f"macfinder_inventory.{kind}"
-        )
-        if not path:
-            return
-        if kind == "json":
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(records, handle, ensure_ascii=False, indent=2)
-        else:
-            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(records[0].keys()))
-                writer.writeheader()
-                writer.writerows(records)
-        self.status_var.set(f"{len(records)} kayıt {kind.upper()} olarak dışa aktarıldı")
 
     def on_close(self):
         if self.active_scanner:

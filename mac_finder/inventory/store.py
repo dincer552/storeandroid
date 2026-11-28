@@ -1,5 +1,6 @@
 """Persistent SQLite device inventory."""
 import ipaddress
+import json
 import os
 import sqlite3
 import threading
@@ -73,8 +74,30 @@ class InventoryStore:
                     found_count INTEGER NOT NULL DEFAULT 0, new_count INTEGER NOT NULL DEFAULT 0
                 )
             """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS meraki_devices (
+                    serial TEXT PRIMARY KEY, organization_id TEXT NOT NULL DEFAULT '',
+                    organization_name TEXT NOT NULL DEFAULT '', network_id TEXT NOT NULL DEFAULT '',
+                    network_name TEXT NOT NULL DEFAULT '', mac TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT '', lan_ip TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '', firmware TEXT NOT NULL DEFAULT '',
+                    tags_json TEXT NOT NULL DEFAULT '[]', address TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '', dashboard_url TEXT NOT NULL DEFAULT '',
+                    last_reported TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT '',
+                    raw_json TEXT NOT NULL DEFAULT '{}', updated_at REAL NOT NULL
+                )
+            """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS meraki_snapshots (
+                    scope TEXT NOT NULL, target TEXT NOT NULL, kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL, updated_at REAL NOT NULL,
+                    PRIMARY KEY(scope, target, kind)
+                )
+            """)
             db.execute("CREATE INDEX IF NOT EXISTS idx_devices_ip ON devices(ip)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_devices_last_seen ON devices(last_seen)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_meraki_mac ON meraki_devices(mac)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_meraki_network ON meraki_devices(network_id)")
 
     def _upsert(self, db, device, now):
         mac = self._mac(device.get("mac"))
@@ -180,3 +203,102 @@ class InventoryStore:
                 INSERT INTO settings(key, value) VALUES (?, ?)
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value
             """, (key, str(value)))
+
+    def save_meraki_device(self, device):
+        serial = self._clean(device.get("serial"))
+        if not serial:
+            raise ValueError("Meraki device serial is required.")
+        raw = device.get("raw") or device
+        now = time.time()
+        with self._lock, self._connection() as db:
+            db.execute("""
+                INSERT INTO meraki_devices (
+                    serial, organization_id, organization_name, network_id, network_name,
+                    mac, model, lan_ip, name, firmware, tags_json, address, notes,
+                    dashboard_url, last_reported, status, raw_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(serial) DO UPDATE SET
+                    organization_id=excluded.organization_id,
+                    organization_name=excluded.organization_name,
+                    network_id=excluded.network_id,
+                    network_name=excluded.network_name,
+                    mac=CASE WHEN excluded.mac='' THEN meraki_devices.mac ELSE excluded.mac END,
+                    model=CASE WHEN excluded.model='' THEN meraki_devices.model ELSE excluded.model END,
+                    lan_ip=CASE WHEN excluded.lan_ip='' THEN meraki_devices.lan_ip ELSE excluded.lan_ip END,
+                    name=CASE WHEN excluded.name='' THEN meraki_devices.name ELSE excluded.name END,
+                    firmware=CASE WHEN excluded.firmware='' THEN meraki_devices.firmware ELSE excluded.firmware END,
+                    tags_json=excluded.tags_json, address=excluded.address, notes=excluded.notes,
+                    dashboard_url=excluded.dashboard_url, last_reported=excluded.last_reported,
+                    status=excluded.status, raw_json=excluded.raw_json, updated_at=excluded.updated_at
+            """, (
+                serial, self._clean(device.get("organization_id")),
+                self._clean(device.get("organization_name")), self._clean(device.get("networkId")),
+                self._clean(device.get("network_name")), self._clean(device.get("mac")),
+                self._clean(device.get("model")), self._clean(device.get("lanIp")),
+                self._clean(device.get("name")), self._clean(device.get("firmware")),
+                json.dumps(device.get("tags") or [], ensure_ascii=False),
+                self._clean(device.get("address")), self._clean(device.get("notes")),
+                self._clean(device.get("url") or device.get("dashboard_url")),
+                self._clean(device.get("lastReportedAt")), self._clean(device.get("status")),
+                json.dumps(raw, ensure_ascii=False, default=str), now,
+            ))
+
+    @staticmethod
+    def _meraki_row(row):
+        item = dict(row)
+        item["tags"] = json.loads(item.pop("tags_json", "[]") or "[]")
+        item["raw"] = json.loads(item.pop("raw_json", "{}") or "{}")
+        return item
+
+    def get_meraki_device(self, serial):
+        with self._lock, self._connection() as db:
+            row = db.execute("SELECT * FROM meraki_devices WHERE serial=?", (self._clean(serial),)).fetchone()
+            return self._meraki_row(row) if row else None
+
+    def get_meraki_devices(self):
+        with self._lock, self._connection() as db:
+            rows = db.execute("SELECT * FROM meraki_devices ORDER BY updated_at DESC").fetchall()
+            return [self._meraki_row(row) for row in rows]
+
+    def find_inventory(self, query):
+        value = self._clean(query)
+        if not value:
+            return [], []
+        pattern = f"%{value}%"
+        with self._lock, self._connection() as db:
+            local_rows = db.execute("""
+                SELECT * FROM devices
+                WHERE mac LIKE ? OR ip LIKE ? OR hostname LIKE ? OR vendor LIKE ?
+                   OR custom_name LIKE ? OR notes LIKE ?
+                ORDER BY online DESC, last_seen DESC
+            """, (pattern,) * 6).fetchall()
+            meraki_rows = db.execute("""
+                SELECT * FROM meraki_devices
+                WHERE serial LIKE ? OR organization_id LIKE ? OR organization_name LIKE ?
+                   OR network_id LIKE ? OR network_name LIKE ? OR mac LIKE ? OR model LIKE ?
+                   OR lan_ip LIKE ? OR name LIKE ? OR firmware LIKE ? OR address LIKE ? OR notes LIKE ?
+                ORDER BY updated_at DESC
+            """, (pattern,) * 12).fetchall()
+        return [dict(row) for row in local_rows], [self._meraki_row(row) for row in meraki_rows]
+
+    def save_snapshot(self, scope, target, kind, payload):
+        with self._lock, self._connection() as db:
+            db.execute("""
+                INSERT INTO meraki_snapshots(scope, target, kind, payload_json, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(scope, target, kind) DO UPDATE SET
+                    payload_json=excluded.payload_json, updated_at=excluded.updated_at
+            """, (
+                self._clean(scope), self._clean(target), self._clean(kind),
+                json.dumps(payload, ensure_ascii=False, default=str), time.time(),
+            ))
+
+    def get_snapshot(self, scope, target, kind):
+        with self._lock, self._connection() as db:
+            row = db.execute("""
+                SELECT payload_json, updated_at FROM meraki_snapshots
+                WHERE scope=? AND target=? AND kind=?
+            """, (self._clean(scope), self._clean(target), self._clean(kind))).fetchone()
+        if not row:
+            return None
+        return {"payload": json.loads(row["payload_json"]), "updated_at": row["updated_at"], "stale": True}
