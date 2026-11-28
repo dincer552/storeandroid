@@ -16,6 +16,7 @@ from ..network.meraki import MerakiClient
 from ..network.snmp import SnmpClient
 from ..network.security import SecureCredentialStore
 from ..gui.meraki_ui import MerakiUIManager
+from ..gui.wifi_ui import WifiUIManager
 from ..network.scanner import ARPScanner
 
 
@@ -32,6 +33,14 @@ class MACFinderApp:
         ("KEŞİF", [("Tek MAC Ara", "⌗"), ("Tüm Ağı Tara", "⌕")]),
         ("SİSTEM", [("Adaptörler", "▦"), ("Ayarlar", "⚙")]),
         ("MERAKI", [("Meraki Inspector", "◇"), ("Switch Overview", "◈"), ("MAC Locator", "⌖"), ("Port Inspector", "▦"), ("PoE Analyzer", "ϟ"), ("Traffic Monitor", "📈"), ("Network Topology", "⬡"), ("Cable Diagnostics", "⌁"), ("Switch Diagnostics", "◎"), ("Events & History", "◷"), ("Local Status Page", "▷"), ("SNMP Monitor", "⇅")]),
+        ("WIFI", [("Wi-Fi Dashboard", "📶"), ("Wi-Fi Scanner", "⌕"),
+                  ("Wi-Fi Channel Analyzer", "📊"), ("Wi-Fi Security", "🔒"),
+                  ("Wi-Fi Profiles", "⚙"), ("Wi-Fi Diagnostics", "🔍")]),
+        ("ENDPOINT AUDIT", [("User Login Audit", "👤"),
+                            ("Wi-Fi Connection History", "📜"),
+                            ("Meraki Wireless Monitor", "✦"),
+                            ("Browser Security Inspector", "🌐"),
+                            ("Security Events", "🚨")]),
     ]
     COLUMNS = (
         "mac", "ip", "custom_name", "hostname", "vendor", "gateway",
@@ -65,6 +74,7 @@ class MACFinderApp:
         self._setup_styles()
         self._build_shell()
         self.meraki_ui = MerakiUIManager(self)
+        self.wifi_ui = WifiUIManager(self)
         self.refresh_adapters()
         self.show_page("Dashboard")
         self.root.after(100, self._poll_events)
@@ -269,18 +279,29 @@ class MACFinderApp:
             "Tek MAC Ara": self._page_mac_lookup,
             "Tüm Ağı Tara": self._page_full_scan,
             "Adaptörler": self._page_adapters,
-            "Meraki Inspector": self.meraki_ui.render,
-            "Switch Overview": self.meraki_ui.render,
-            "MAC Locator": self.meraki_ui.render,
-            "Port Inspector": self.meraki_ui.render,
-            "PoE Analyzer": self.meraki_ui.render,
-            "Traffic Monitor": self.meraki_ui.render,
-            "Network Topology": self.meraki_ui.render,
-            "Cable Diagnostics": self.meraki_ui.render,
-            "Switch Diagnostics": self.meraki_ui.render,
-            "Events & History": self.meraki_ui.render,
-            "Local Status Page": self.meraki_ui.render,
-            "SNMP Monitor": self.meraki_ui.render,
+            "Meraki Inspector": lambda p="Meraki Inspector": self.meraki_ui.render(p),
+            "Switch Overview": lambda p="Switch Overview": self.meraki_ui.render(p),
+            "MAC Locator": lambda p="MAC Locator": self.meraki_ui.render(p),
+            "Port Inspector": lambda p="Port Inspector": self.meraki_ui.render(p),
+            "PoE Analyzer": lambda p="PoE Analyzer": self.meraki_ui.render(p),
+            "Traffic Monitor": lambda p="Traffic Monitor": self.meraki_ui.render(p),
+            "Network Topology": lambda p="Network Topology": self.meraki_ui.render(p),
+            "Cable Diagnostics": lambda p="Cable Diagnostics": self.meraki_ui.render(p),
+            "Switch Diagnostics": lambda p="Switch Diagnostics": self.meraki_ui.render(p),
+            "Events & History": lambda p="Events & History": self.meraki_ui.render(p),
+            "Local Status Page": lambda p="Local Status Page": self.meraki_ui.render(p),
+            "SNMP Monitor": lambda p="SNMP Monitor": self.meraki_ui.render(p),
+            "Wi-Fi Dashboard": lambda p="Wi-Fi Dashboard": self.wifi_ui.render(p),
+            "Wi-Fi Scanner": lambda p="Wi-Fi Scanner": self.wifi_ui.render(p),
+            "Wi-Fi Channel Analyzer": lambda p="Wi-Fi Channel Analyzer": self.wifi_ui.render(p),
+            "Wi-Fi Security": lambda p="Wi-Fi Security": self.wifi_ui.render(p),
+            "Wi-Fi Profiles": lambda p="Wi-Fi Profiles": self.wifi_ui.render(p),
+            "Wi-Fi Diagnostics": self._page_wifi_diagnostics,
+            "User Login Audit": lambda p="User Login Audit": self.wifi_ui.render(p),
+            "Wi-Fi Connection History": lambda p="Wi-Fi Connection History": self.wifi_ui.render(p),
+            "Meraki Wireless Monitor": lambda p="Meraki Wireless Monitor": self.wifi_ui.render(p),
+            "Browser Security Inspector": lambda p="Browser Security Inspector": self.wifi_ui.render(p),
+            "Security Events": lambda p="Security Events": self.wifi_ui.render(p),
             "Ayarlar": self._page_settings,
         }
         renderers[page]()
@@ -609,6 +630,52 @@ class MACFinderApp:
             "Güvenlik sınırı: yalnızca seçilen IPv4 subnet'i taranır; maksimum 4.096 host. Port taraması, paket enjeksiyonu, deauth veya saldırı işlemi yoktur.",
             self.C["muted"], 8).pack(anchor="w", pady=(12, 0))
 
+    def _page_adapters(self):
+        self._section(self.content, "Adaptörler", "Aktif ağ adaptörleri listesi")
+        panel = self._panel(self.content)
+        tree = self._create_table(panel)
+        try:
+            for a in get_active_adapters():
+                tree.insert("", "end", values=(
+                    a.get("mac", ""), a.get("ip", ""), a.get("hostname", ""),
+                    a.get("vendor", ""), a.get("gateway", ""), a.get("interface", ""),
+                    a.get("method", ""), ""
+                ))
+        except Exception as exc:
+            self._error("Adaptör hatası", str(exc))
+
+    def _page_settings(self):
+        self._section(self.content, "Ayarlar", "Uygulama yapılandırması")
+        panel = self._panel(self.content)
+        self._label(panel, "Veritabanı: " + str(self.store.path), self.C["muted"], 10).pack(padx=24, pady=8)
+
+    def _page_wifi_diagnostics(self):
+        from ..network.wifi import WifiScanner
+        scanner = WifiScanner()
+        info = scanner.connected_info()
+        networks = scanner.scan_networks()
+        self._section(self.content, "Wi-Fi Diagnostics",
+                     "Gerçek Wi-Fi adaptörü durumu ve bağlantı testi (read-only).")
+        panel = self._panel(self.content)
+        rows = [
+            ("Adapter", info.get("adapter") or "Bilinmiyor"),
+            ("Adapter State", info.get("state") or "Bilinmiyor"),
+            ("SSID", info.get("ssid") or "Bilinmiyor"),
+            ("Signal", f"{info.get('signal', 0)}%"),
+            ("Kanal", info.get("channel") or 0),
+            ("Bant", info.get("band") or "Bilinmiyor"),
+            ("Network Count", len(networks or [])),
+        ]
+        from tkinter import ttk
+        frame = ttk.Frame(panel)
+        frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(frame, columns=("field", "value"), show="headings")
+        tree.heading("field", text="Alan")
+        tree.heading("value", text="Değer")
+        for row in rows:
+            tree.insert("", "end", values=(row[0], row[1]))
+        tree.pack(fill="both", expand=True)
+
     def _scan_progress(self, parent):
         self.progress_var = tk.DoubleVar(value=0)
         self.progress = ttk.Progressbar(parent, variable=self.progress_var,
@@ -638,6 +705,32 @@ class MACFinderApp:
 
     def _progress_callback(self, done, total):
         self.events.put(("progress", done, total))
+
+    def _poll_events(self):
+        try:
+            while True:
+                ev = self.events.get_nowait()
+                try:
+                    kind = ev[0] if isinstance(ev, tuple) else "msg"
+                    if kind == "progress" and len(ev) >= 3:
+                        done, total = ev[1], ev[2]
+                        pct = (done / total * 100) if total else 0
+                        if hasattr(self, "progress_var"):
+                            self.progress_var.set(pct)
+                            self.progress_text.config(text=f"%{pct:.0f} · {done}/{total}")
+                    elif kind == "error":
+                        self.status_var.set(f"Hata: {ev[2]}")
+                        self.activity_label.config(text="ERROR", fg=self.C["red"])
+                    elif kind == "result":
+                        self.status_var.set(f"Tamamlandı: {ev[1]}")
+                        self.activity_label.config(text="OK", fg=self.C["green"])
+                    else:
+                        self.status_var.set(str(ev))
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        self.root.after(150, self._poll_events)
 
     def _start_mac_lookup(self):
         mac = normalize_mac(self.mac_entry.get())

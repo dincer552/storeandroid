@@ -302,3 +302,17 @@ class InventoryStore:
         if not row:
             return None
         return {"payload": json.loads(row["payload_json"]), "updated_at": row["updated_at"], "stale": True}
+
+    # ---------------------------------------------------------------- Wi-Fi / endpoint security
+    def get_browser_security(self):
+        with self._lock, self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM browser_security_inventory ORDER BY scanned_at DESC").fetchall()
+            return [dict(row) for row in rows]
+
+    def get_security_alerts(self, limit=100):
+        with self._lock, self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM security_alerts ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(int(limit), 500)),)).fetchall()
+            return [dict(row) for row in rows]
