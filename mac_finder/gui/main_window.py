@@ -13,6 +13,8 @@ from ..inventory import InventoryStore
 from ..network.adapter import get_active_adapters, get_adapter_stats
 from ..network.mac import normalize_mac
 from ..network.meraki import MerakiClient
+from ..network.snmp import SnmpClient
+from ..gui.meraki_ui import MerakiUIManager
 from ..network.scanner import ARPScanner
 
 
@@ -27,7 +29,8 @@ class MACFinderApp:
     NAV = [
         ("GENEL", [("Dashboard", "◈"), ("Cihaz Envanteri", "▤")]),
         ("KEŞİF", [("Tek MAC Ara", "⌗"), ("Tüm Ağı Tara", "⌕")]),
-        ("SİSTEM", [("Adaptörler", "▦"), ("Meraki API", "◇"), ("Ayarlar", "⚙")]),
+        ("SİSTEM", [("Adaptörler", "▦"), ("Ayarlar", "⚙")]),
+        ("MERAKI", [("Meraki Inspector", "◇"), ("Switch Overview", "◈"), ("MAC Locator", "⌖"), ("Port Inspector", "▦"), ("PoE Analyzer", "ϟ"), ("Traffic Monitor", "📈"), ("Network Topology", "⬡"), ("Cable Diagnostics", "⌁"), ("Switch Diagnostics", "◎"), ("Events & History", "◷"), ("Local Status Page", "▷"), ("SNMP Monitor", "⇅")]),
     ]
     COLUMNS = (
         "mac", "ip", "custom_name", "hostname", "vendor", "gateway",
@@ -59,6 +62,7 @@ class MACFinderApp:
         self.notify_var = tk.BooleanVar(value=self.store.get_setting("notify_new", "0") == "1")
         self._setup_styles()
         self._build_shell()
+        self.meraki_ui = MerakiUIManager(self)
         self.refresh_adapters()
         self.show_page("Dashboard")
         self.root.after(100, self._poll_events)
@@ -252,7 +256,18 @@ class MACFinderApp:
             "Tek MAC Ara": self._page_mac_lookup,
             "Tüm Ağı Tara": self._page_full_scan,
             "Adaptörler": self._page_adapters,
-            "Meraki API": self._page_meraki,
+            "Meraki Inspector": self.meraki_ui.render,
+            "Switch Overview": self.meraki_ui.render,
+            "MAC Locator": self.meraki_ui.render,
+            "Port Inspector": self.meraki_ui.render,
+            "PoE Analyzer": self.meraki_ui.render,
+            "Traffic Monitor": self.meraki_ui.render,
+            "Network Topology": self.meraki_ui.render,
+            "Cable Diagnostics": self.meraki_ui.render,
+            "Switch Diagnostics": self.meraki_ui.render,
+            "Events & History": self.meraki_ui.render,
+            "Local Status Page": self.meraki_ui.render,
+            "SNMP Monitor": self.meraki_ui.render,
             "Ayarlar": self._page_settings,
         }
         renderers[page]()
